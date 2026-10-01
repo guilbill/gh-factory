@@ -1,0 +1,17 @@
+name: Factory Review
+
+# Written by `gh factory init`. Do not rename: the factory relies on this file name
+# and workflow name. Upgrade with `gh factory upgrade`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: __FACTORY_REPO__/.github/workflows/review.yml@__FACTORY_REF__
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

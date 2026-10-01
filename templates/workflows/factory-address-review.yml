@@ -1,0 +1,42 @@
+name: Factory Address Review
+
+# Written by `gh factory init`. Do not rename: the factory relies on this file name
+# and workflow name. Upgrade with `gh factory upgrade`.
+
+on:
+  workflow_run:
+    workflows: ["Factory Review"]
+    types: [completed]
+  issue_comment:
+    types: [created]
+  push:
+    branches: [__DEFAULT_BRANCH__]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number"
+        required: true
+      branch:
+        description: "Pull request head branch"
+        required: true
+      mode:
+        description: "review or conflict"
+        required: true
+        default: conflict
+
+jobs:
+  address-review:
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: __FACTORY_REPO__/.github/workflows/address-review.yml@__FACTORY_REF__
+    with:
+      pr: ${{ inputs.pr }}
+      branch: ${{ inputs.branch }}
+      mode: ${{ inputs.mode }}
+      # extra_allowed_tools: "Bash(docker:*)"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

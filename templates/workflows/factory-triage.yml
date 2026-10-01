@@ -1,0 +1,18 @@
+name: Factory Triage
+
+# Written by `gh factory init`. Do not rename: the factory relies on this file name
+# and workflow name. Upgrade with `gh factory upgrade`.
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    permissions:
+      contents: read
+      issues: write
+    uses: __FACTORY_REPO__/.github/workflows/triage.yml@__FACTORY_REF__
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

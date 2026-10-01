@@ -1,0 +1,27 @@
+name: Factory Improve Review
+
+# Written by `gh factory init`. Do not rename: the factory relies on this file name
+# and workflow name. Upgrade with `gh factory upgrade`.
+
+on:
+  schedule:
+    - cron: "0 13 * * *" # 13:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      since_hours:
+        description: "How many hours of review feedback to inspect"
+        required: false
+        default: "24"
+
+jobs:
+  improve-review:
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+    uses: __FACTORY_REPO__/.github/workflows/improve-review.yml@__FACTORY_REF__
+    with:
+      since_hours: ${{ inputs.since_hours || '24' }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

@@ -1,0 +1,229 @@
+name: Factory review
+
+# Reusable: reviews an opened or updated pull request with Claude Code.
+#
+# The agent runs with read-only GitHub permissions and writes structured
+# findings to review.json. A separate publish job validates that artifact
+# against the annotated diff and posts the GitHub review.
+#
+# Called from the target repo's factory-review.yml on `pull_request`. That
+# caller must keep the name "Factory Review": factory-address-review.yml
+# listens to it through `workflow_run`.
+#
+# Optional: enable "Allow GitHub Actions to create and approve pull requests"
+# in the Actions settings if APPROVE review events should succeed. Otherwise
+# publish_review.py falls back to COMMENT for approvals.
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  review:
+    name: Review pull request
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    concurrency:
+      group: factory-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fetch factory skills
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Keep factory files out of git
+        run: |
+          test -f .factory/skills/review-pr/SKILL.md || { echo "::error::Factory skills were not fetched." >&2; exit 1; }
+          echo ".factory/" >> .git/info/exclude
+
+      - name: Prepare review artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SCRIPTS: .factory/skills/review-pr/scripts
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "${BASE_SHA}" "${HEAD_SHA}"
+
+          # Prefer the three-dot PR range so the annotated diff matches GitHub's
+          # pull request file view as closely as possible.
+          git diff --find-renames "${BASE_SHA}...${HEAD_SHA}" > raw_diff.txt
+
+          python3 "${SCRIPTS}/annotate_diff.py" --input raw_diff.txt --output pr_diff.txt
+
+          gh pr view "${PR_NUMBER}" --repo "${REPO}" --json title,body,baseRefName,headRefName,author,url > pr_meta.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          meta = json.loads(Path("pr_meta.json").read_text(encoding="utf-8"))
+          body = (meta.get("body") or "").strip() or "No description provided."
+          author = ((meta.get("author") or {}).get("login") or "unknown")
+          pr_number = os.environ["PR_NUMBER"]
+          text = (
+              f"# Pull Request #{pr_number}\n\n"
+              f"- Title: {meta.get('title') or ''}\n"
+              f"- Base branch: {meta.get('baseRefName') or ''}\n"
+              f"- Head branch: {meta.get('headRefName') or ''}\n"
+              f"- Author: {author}\n"
+              f"- URL: {meta.get('url') or ''}\n\n"
+              f"## Body\n\n{body}\n"
+          )
+          Path("pr_description.txt").write_text(text, encoding="utf-8")
+          PY
+
+          python3 "${SCRIPTS}/resolve_spec_context.py" \
+            --repo "${REPO}" \
+            --pr "${PR_NUMBER}" \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --output spec_context.md || true
+
+          if [ ! -s spec_context.md ]; then
+            printf 'No approved or repository spec context was found for this PR.\n' > spec_context.md
+          fi
+
+          echo "Prepared review artifacts:"
+          wc -l raw_diff.txt pr_diff.txt pr_description.txt spec_context.md
+
+      - name: Upload review inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-inputs-pr-${{ github.event.pull_request.number }}
+          path: |
+            pr_diff.txt
+            pr_description.txt
+            spec_context.md
+          if-no-files-found: error
+
+      - name: Review with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Review GitHub pull request #${{ github.event.pull_request.number }} in this repository using the review-pr skill.
+
+            First read `.factory/skills/review-pr/SKILL.md`, then follow it exactly.
+            Its scripts live in `.factory/skills/review-pr/scripts/`. Read
+            `.agents/review-lessons.md` if it exists: it holds this repository's
+            review conventions.
+
+            - Repository: ${{ github.repository }}
+            - Pull request URL: ${{ github.event.pull_request.html_url }}
+            - Base branch: ${{ github.event.pull_request.base.ref }}
+            - Head branch: ${{ github.event.pull_request.head.ref }}
+            - Head SHA: ${{ github.event.pull_request.head.sha }}
+
+            Local review artifacts are already prepared in the working directory:
+            - `pr_diff.txt`: annotated PR diff
+            - `pr_description.txt`: PR metadata and description
+            - `spec_context.md`: product/tech specs when resolvable
+
+            If `spec_context.md` only says no context was found, you may regenerate it with:
+            `python3 .factory/skills/review-pr/scripts/resolve_spec_context.py --repo ${{ github.repository }} --pr ${{ github.event.pull_request.number }} --output spec_context.md`
+
+            Review the PR, write `review.json` to the working directory, and validate it with:
+            `python3 .factory/skills/review-pr/scripts/validate_review_json.py --review-json review.json --diff pr_diff.txt`
+
+            `.factory/` holds the factory's own skills, not this PR's code.
+            Do not post the review to GitHub. Leave the validated `review.json` file in the working directory.
+          claude_args: |
+            --allowedTools "Read,Write,Glob,Grep,Bash(python3 .factory/skills/review-pr/scripts/*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git log:*),Bash(git show:*),Bash(git diff:*)"
+
+      - name: Check review.json
+        run: |
+          set -euo pipefail
+
+          if [ ! -f review.json ]; then
+            echo "::error::The agent did not write review.json." >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("review.json").read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or "verdict" not in payload or "comments" not in payload:
+              raise SystemExit("review.json is missing required verdict/comments fields")
+          print(
+              f"Using review.json "
+              f"(verdict={payload.get('verdict')}, comments={len(payload.get('comments') or [])})"
+          )
+          PY
+
+      - name: Upload review result
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-result-pr-${{ github.event.pull_request.number }}
+          path: review.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish review
+    needs: review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Fetch factory scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Download review inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: review-inputs-pr-${{ github.event.pull_request.number }}
+
+      - name: Download review result
+        uses: actions/download-artifact@v4
+        with:
+          name: review-result-pr-${{ github.event.pull_request.number }}
+
+      - name: Publish review.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f review.json ]; then
+            echo "::error::review.json artifact is missing." >&2
+            exit 1
+          fi
+          if [ ! -f pr_diff.txt ]; then
+            echo "::error::pr_diff.txt artifact is missing." >&2
+            exit 1
+          fi
+
+          python3 .factory/skills/review-pr/scripts/publish_review.py \
+            --review-json review.json \
+            --diff pr_diff.txt \
+            --repo "${REPO}" \
+            --pr "${PR_NUMBER}"

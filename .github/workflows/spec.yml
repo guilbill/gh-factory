@@ -1,0 +1,84 @@
+name: Factory spec
+
+# Reusable: writes PRODUCT.md and TECH.md for an issue labeled ready to spec,
+# opens a specs PR and reports back on the issue.
+#
+# Called from the target repo's factory-spec.yml on `issues: labeled`.
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      FACTORY_TOKEN:
+        required: false
+
+jobs:
+  spec:
+    name: Spec issue
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.label.name == 'Ready to spec' ||
+      github.event.label.name == 'ready-to-spec' ||
+      github.event.label.name == 'ready to spec'
+    concurrency:
+      group: factory-spec-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # let the agent commit and push a specs branch
+      issues: write # let the agent post progress and update labels
+      pull-requests: write # let the agent open the specs PR
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Pushes and PRs made with a PAT trigger the review workflow.
+          token: ${{ secrets.FACTORY_TOKEN || github.token }}
+
+      - name: Fetch factory skills
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Keep factory files out of git
+        run: |
+          test -f .factory/skills/spec/SKILL.md || { echo "::error::Factory skills were not fetched." >&2; exit 1; }
+          echo ".factory/" >> .git/info/exclude
+
+      - name: Spec issue with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.FACTORY_TOKEN || github.token }}
+          prompt: |
+            Create checked-in product and technical specs for the GitHub issue that was just labeled ready to spec.
+
+            First read `.factory/skills/spec/SKILL.md`, then follow it exactly.
+
+            - Repository: ${{ github.repository }}
+            - Issue number: #${{ github.event.issue.number }}
+            - Issue URL: ${{ github.event.issue.html_url }}
+            - Applied label: ${{ github.event.label.name }}
+            - Follow-along link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Follow the spec skill: fetch the full issue and comments with the
+            authenticated `gh` CLI, read `roadmap.md` and `vision.md` if
+            present, inspect this checked-out codebase, and use the sibling
+            spec-writing skills to create:
+
+            - `specs/<issue-slug>/PRODUCT.md`
+            - `specs/<issue-slug>/TECH.md`
+
+            Create a specs branch named `spec/issue-${{ github.event.issue.number }}-<short-slug>`,
+            commit the spec files, push the branch, and open a GitHub pull
+            request for review. Post status comments as directed by the skill.
+
+            `.factory/` holds the factory's own skills: never edit or commit it.
+            Do not implement the issue. Do not apply `Ready to implement`
+            until the specs PR has been reviewed or the repository explicitly
+            treats authored specs as implementation-ready without review.
+          claude_args: |
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh:*),Bash(ls:*),Bash(mkdir:*)"

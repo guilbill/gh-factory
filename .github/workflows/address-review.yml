@@ -1,0 +1,254 @@
+name: Factory address review
+
+# Reusable: fixes review feedback and merge conflicts on factory pull requests.
+#
+# Called from the target repo's factory-address-review.yml, which triggers:
+# - on `workflow_run` of "Factory Review" when its latest review on the PR head
+#   is CHANGES_REQUESTED (capped at `max_auto_rounds` automatic rounds per PR);
+# - on every push to the default branch, for each open factory PR that now
+#   conflicts. claude-code-action rejects `push` events, so the push only
+#   detects conflicts and re-dispatches the caller once per conflicting PR;
+# - on a `/fix ...` PR comment from an owner, member or collaborator. The rest
+#   of the comment is passed to the agent. Not capped;
+# - on `workflow_dispatch` with pr/branch/mode inputs (used by the push path).
+#
+# The agent follows .factory/skills/address-review/SKILL.md and pushes a
+# follow-up commit with FACTORY_TOKEN, so the review runs again on the new head.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: "Pull request number (workflow_dispatch only)"
+        type: string
+        required: false
+        default: ""
+      branch:
+        description: "Pull request head branch (workflow_dispatch only)"
+        type: string
+        required: false
+        default: ""
+      mode:
+        description: "review or conflict (workflow_dispatch only)"
+        type: string
+        required: false
+        default: conflict
+      caller_workflow:
+        description: "File name of the caller workflow, re-dispatched for conflicting PRs"
+        type: string
+        required: false
+        default: factory-address-review.yml
+      max_auto_rounds:
+        description: "Automatic fix rounds per PR before handing back to a human"
+        type: number
+        required: false
+        default: 2
+      extra_allowed_tools:
+        description: "Extra Claude Code tool rules, comma-separated, e.g. Bash(docker:*)"
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      FACTORY_TOKEN:
+        required: false
+
+env:
+  # Same toolchain list as implement.yml. Interpreters can run arbitrary code:
+  # this list keeps the agent on familiar tools, it is not a sandbox.
+  TOOLCHAIN_TOOLS: "Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(bun:*),Bash(bunx:*),Bash(corepack:*),Bash(node:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(pip3:*),Bash(uv:*),Bash(uvx:*),Bash(poetry:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*),Bash(composer:*),Bash(php:*),Bash(vendor/bin/*),Bash(./vendor/bin/*),Bash(go:*),Bash(golangci-lint:*),Bash(cargo:*),Bash(bundle:*),Bash(ruby:*),Bash(rake:*),Bash(mvn:*),Bash(./mvnw:*),Bash(gradle:*),Bash(./gradlew:*),Bash(make:*),Bash(just:*),Bash(task:*)"
+  BASE_TOOLS: "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*)"
+
+jobs:
+  resolve:
+    name: Decide what to fix
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/fix') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    permissions:
+      actions: write # re-dispatch the caller workflow for conflicting PRs
+      issues: write # create the fix-round labels
+      pull-requests: write # label the PR and post the hand-off comment
+    outputs:
+      targets: ${{ steps.decide.outputs.targets }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          COMMENT_PR: ${{ github.event.issue.number }}
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_MODE: ${{ inputs.mode }}
+          CALLER_WORKFLOW: ${{ inputs.caller_workflow }}
+          MAX_AUTO_ROUNDS: ${{ inputs.max_auto_rounds }}
+          FACTORY_BRANCH: '^[a-z]+/issue-[0-9]+'
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "targets=$1" >> "$GITHUB_OUTPUT"
+            echo "Targets: $1"
+            exit 0
+          }
+
+          skip() {
+            echo "Skipping: $1"
+            emit '[]'
+          }
+
+          # Dispatched run: fix exactly the PR it was dispatched for.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            [[ "$INPUT_BRANCH" =~ $FACTORY_BRANCH ]] || skip "$INPUT_BRANCH is not a factory branch"
+            [[ "$INPUT_MODE" =~ ^(review|conflict)$ ]] || skip "unknown mode $INPUT_MODE"
+            emit "$(jq -nc --arg pr "$INPUT_PR" --arg branch "$INPUT_BRANCH" --arg mode "$INPUT_MODE" \
+              '[{pr: $pr, branch: $branch, round: "", mode: $mode}]')"
+          fi
+
+          # Push to the default branch: dispatch one run per open factory PR that now conflicts.
+          if [ "$EVENT" = "push" ]; then
+            while read -r pr branch; do
+              [ -n "$pr" ] || continue
+              # GitHub computes mergeability asynchronously after a push.
+              mergeable=UNKNOWN
+              for _ in $(seq 1 10); do
+                mergeable="$(gh pr view "$pr" --repo "$REPO" --json mergeable --jq .mergeable)"
+                [ "$mergeable" != "UNKNOWN" ] && break
+                sleep 6
+              done
+              echo "PR #$pr ($branch): $mergeable"
+              if [ "$mergeable" = "CONFLICTING" ]; then
+                gh workflow run "$CALLER_WORKFLOW" --repo "$REPO" --ref "$DEFAULT_BRANCH" \
+                  -f pr="$pr" -f branch="$branch" -f mode=conflict
+              fi
+            done < <(gh pr list --repo "$REPO" --state open --json number,headRefName \
+              --jq ".[] | select(.headRefName | test(\"$FACTORY_BRANCH\")) | \"\(.number) \(.headRefName)\"")
+            emit '[]'
+          fi
+
+          if [ "$EVENT" = "workflow_run" ]; then
+            PR="${RUN_PR:-}"
+            if [ -z "$PR" ]; then
+              PR="$(gh pr list --repo "$REPO" --head "$RUN_BRANCH" --state open --json number --jq '.[0].number // empty')"
+            fi
+          else
+            PR="$COMMENT_PR"
+          fi
+          [ -n "$PR" ] || skip "no pull request found"
+
+          gh pr view "$PR" --repo "$REPO" --json state,headRefName,headRefOid,labels > pr.json
+          STATE="$(jq -r .state pr.json)"
+          BRANCH="$(jq -r .headRefName pr.json)"
+          HEAD="$(jq -r .headRefOid pr.json)"
+          ROUNDS="$(jq '[.labels[].name | select(startswith("fix-round-"))] | length' pr.json)"
+
+          [ "$STATE" = "OPEN" ] || skip "PR #$PR is $STATE"
+          [[ "$BRANCH" =~ $FACTORY_BRANCH ]] || skip "$BRANCH is not a factory branch"
+
+          if [ "$EVENT" = "workflow_run" ]; then
+            LATEST="$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+              --jq '[.[] | select(.user.login == "github-actions[bot]")] | last | "\(.state) \(.commit_id)"')"
+            [ "$LATEST" = "CHANGES_REQUESTED $HEAD" ] || skip "latest bot review on $HEAD is not CHANGES_REQUESTED ($LATEST)"
+
+            if [ "$ROUNDS" -ge "$MAX_AUTO_ROUNDS" ]; then
+              if ! jq -e '.labels[].name | select(. == "fix-rounds-exhausted")' pr.json > /dev/null; then
+                gh label create fix-rounds-exhausted --repo "$REPO" --color B60205 --force \
+                  --description "Factory stopped auto-fixing this PR"
+                gh pr edit "$PR" --repo "$REPO" --add-label fix-rounds-exhausted
+                gh pr comment "$PR" --repo "$REPO" --body "The review still requests changes after $ROUNDS automatic fix rounds, so I'm handing this one back to a human. Comment \`/fix\` with instructions to run another round."
+              fi
+              skip "automatic fix rounds exhausted"
+            fi
+          fi
+
+          ROUND=$((ROUNDS + 1))
+          gh label create "fix-round-$ROUND" --repo "$REPO" --color C5DEF5 --force \
+            --description "Factory review-fix round $ROUND"
+          gh pr edit "$PR" --repo "$REPO" --add-label "fix-round-$ROUND"
+
+          emit "$(jq -nc --arg pr "$PR" --arg branch "$BRANCH" --arg round "$ROUND" \
+            '[{pr: $pr, branch: $branch, round: $round, mode: "review"}]')"
+
+  fix:
+    name: Fix PR #${{ matrix.target.pr }} (${{ matrix.target.mode }})
+    needs: resolve
+    if: needs.resolve.outputs.targets != '' && needs.resolve.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
+    concurrency:
+      group: factory-address-review-${{ matrix.target.branch }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # push the follow-up commit
+      pull-requests: write # reply to review comments
+      issues: write # post the summary comment
+    steps:
+      - name: Checkout pull request branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.target.branch }}
+          fetch-depth: 0 # merging the base branch needs the shared history
+          # Pushes made with a PAT trigger the review workflow again.
+          token: ${{ secrets.FACTORY_TOKEN || github.token }}
+
+      - name: Fetch factory skills
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Keep factory files out of git
+        run: |
+          test -f .factory/skills/address-review/SKILL.md || { echo "::error::Factory skills were not fetched." >&2; exit 1; }
+          echo ".factory/" >> .git/info/exclude
+
+      - name: Save the human fix request
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: printf '%s\n' "$COMMENT_BODY" > "$RUNNER_TEMP/fix_request.md"
+
+      - name: Address review with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.FACTORY_TOKEN || github.token }}
+          # Conflict runs are dispatched by this workflow itself, so the actor
+          # is the github-actions bot. Only allow that one bot.
+          allowed_bots: "github-actions,github-actions[bot]"
+          prompt: |
+            Address pull request #${{ matrix.target.pr }} in `${{ matrix.target.mode }}` mode.
+
+            First read `.factory/skills/address-review/SKILL.md`, then follow it exactly.
+            It points to the sibling `.factory/skills/repo-toolchain/SKILL.md`
+            for installing dependencies and running this repository's checks.
+
+            - Repository: ${{ github.repository }}
+            - Pull request: #${{ matrix.target.pr }}
+            - Branch (already checked out): ${{ matrix.target.branch }}
+            - Mode: ${{ matrix.target.mode }}
+            - Fix round: ${{ matrix.target.round || 'n/a (conflict resolution)' }}
+            - Human fix request: `${{ runner.temp }}/fix_request.md` (only present when a human commented `/fix`; never commit it)
+            - Follow-along: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            `.factory/` holds the factory's own skills: never edit or commit it.
+          claude_args: |
+            --allowedTools "${{ env.BASE_TOOLS }},${{ env.TOOLCHAIN_TOOLS }}${{ inputs.extra_allowed_tools && format(',{0}', inputs.extra_allowed_tools) || '' }}"

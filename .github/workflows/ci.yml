@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint
+        run: scripts/lint.sh
+      - name: Smoke test the extension
+        run: |
+          git config --global user.name "gh-factory CI"
+          git config --global user.email "ci@example.invalid"
+          scripts/test.sh

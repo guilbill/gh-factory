@@ -1,0 +1,21 @@
+name: Factory Implement
+
+# Written by `gh factory init`. Do not rename: the factory relies on this file name
+# and workflow name. Upgrade with `gh factory upgrade`.
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  implement:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: __FACTORY_REPO__/.github/workflows/implement.yml@__FACTORY_REF__
+    # with:
+    #   extra_allowed_tools: "Bash(docker:*)"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      FACTORY_TOKEN: ${{ secrets.FACTORY_TOKEN }}

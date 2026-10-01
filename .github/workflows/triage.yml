@@ -1,0 +1,136 @@
+name: Factory triage
+
+# Reusable: triages a newly opened issue with Claude Code.
+#
+# The agent runs read-only (issues: read) and returns a JSON result validated
+# against a schema. The separate `apply` job applies the label and comment with
+# FACTORY_TOKEN, so the label fires the spec/implement workflows.
+#
+# Called from the target repo's factory-triage.yml on `issues: opened`.
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      FACTORY_TOKEN:
+        required: false
+
+jobs:
+  triage:
+    name: Triage issue
+    runs-on: ubuntu-latest
+    concurrency:
+      group: factory-triage-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read # let the agent inspect the checked-out codebase
+      issues: read # let the agent read the issue/comments/labels, never write
+    outputs:
+      triage_result: ${{ steps.triage.outputs.structured_output }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch factory skills
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Keep factory files out of git
+        run: |
+          test -f .factory/skills/triage/SKILL.md || { echo "::error::Factory skills were not fetched." >&2; exit 1; }
+          echo ".factory/" >> .git/info/exclude
+
+      - name: Triage with Claude Code
+        uses: anthropics/claude-code-action@v1
+        id: triage
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Triage GitHub issue #${{ github.event.issue.number }} in this
+            repository. First read `.factory/skills/triage/SKILL.md`, then
+            follow it exactly.
+
+            - Repository: ${{ github.repository }}
+            - Issue URL: ${{ github.event.issue.html_url }}
+
+            Use the `gh` CLI to fetch the full issue (title, body, comments,
+            existing labels) and related open issues, read `roadmap.md` and
+            `vision.md` if present, inspect this checked-out codebase, then
+            choose exactly one implementation-readiness state. `.factory/` holds
+            the factory's own skills, not this repository's code: ignore it
+            when assessing the codebase.
+
+            Return the result the skill specifies as your structured output.
+            Do not comment on, label, or otherwise mutate the issue.
+          claude_args: |
+            --allowedTools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh label list:*),Bash(git log:*)"
+            --json-schema '{"type":"object","properties":{"state":{"type":"string","enum":["Ready to implement","Ready to spec","Needs info","Wait to implement"]},"label":{"type":"string"},"remove_labels":{"type":"array","items":{"type":"string"}},"comment":{"type":"string"}},"required":["state","label","comment"]}'
+
+  apply:
+    name: Apply triage result
+    needs: triage
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Apply label and comment
+        env:
+          # A PAT, not GITHUB_TOKEN, so the label fires the implement/spec workflows.
+          GH_TOKEN: ${{ secrets.FACTORY_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          TRIAGE_RESULT: ${{ needs.triage.outputs.triage_result }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TRIAGE_RESULT:-}" ]; then
+            echo "::error::Triage job produced no output; nothing to apply." >&2
+            exit 1
+          fi
+
+          # structured_output is already validated against the schema in the
+          # triage job; jq only checks that it parses.
+          if ! printf '%s' "$TRIAGE_RESULT" | jq . > triage_result.json; then
+            echo "::error::Triage output is not valid JSON:" >&2
+            printf '%s\n' "$TRIAGE_RESULT" >&2
+            exit 1
+          fi
+
+          STATE="$(jq -r '.state // ""' triage_result.json)"
+          LABEL="$(jq -r '.label // ""' triage_result.json)"
+
+          if [ -z "$STATE" ]; then
+            echo "::error::Triage result is missing a 'state'." >&2
+            exit 1
+          fi
+
+          if [ -z "$LABEL" ]; then
+            echo "::error::Triage result is missing a 'label' to apply." >&2
+            exit 1
+          fi
+
+          echo "Triage state: $STATE"
+          echo "Applying label: $LABEL"
+
+          # Remove any superseded triage-state labels the agent listed. Failures
+          # (e.g. a label that is not present) are non-fatal.
+          while IFS= read -r remove_label; do
+            [ -z "$remove_label" ] && continue
+            echo "Removing label: $remove_label"
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "$remove_label" || true
+          done < <(jq -r '(.remove_labels // [])[]' triage_result.json)
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$LABEL"
+
+          jq -r '.comment // ""' triage_result.json > comment.md
+          if [ -s comment.md ]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file comment.md
+          else
+            echo "No comment body provided by triage result; skipping comment."
+          fi

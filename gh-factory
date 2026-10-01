@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# gh factory: wire a GitHub repository onto the gh-factory workflows.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATES_DIR="$SCRIPT_DIR/templates/workflows"
+DEFAULT_REF="v1"
+LESSONS_FILE=".agents/review-lessons.md"
+WIRE_BRANCH="chore/wire-factory"
+
+# label|color|description
+LABELS=(
+  "Ready to implement|0E8A16|Factory: an agent can implement this now"
+  "Ready to spec|1D76DB|Factory: write product and tech specs first"
+  "Needs info|FBCA04|Factory: missing details before work can start"
+  "Wait to implement|D4C5F9|Factory: not now (roadmap, dependency, decision)"
+)
+
+ASSUME_YES=0
+TMP_DIR=""
+trap 'if [ -n "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi' EXIT
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+Wire a repository onto the gh-factory workflows.
+
+Usage:
+  gh factory init [flags]       Add the factory workflows, labels and secrets
+  gh factory upgrade [ref]      Point the factory workflows at another version
+  gh factory help
+
+Run both commands from the root of the target repository's checkout.
+
+init flags:
+  --ref <ref>        gh-factory version to call (default: v1)
+  --local            Only write files: no branch, labels, secrets, commit or PR
+  --no-pr            Commit and push the branch, but do not open a PR
+  --skip-secrets     Do not check or set secrets
+  --force            Overwrite factory files that differ, without asking
+  -y, --yes          Answer yes to every confirmation
+
+upgrade flags:
+  --no-pr            Commit and push the branch, but do not open a PR
+  --local            Only rewrite files
+
+Environment:
+  GH_FACTORY_REPO    owner/repo hosting the reusable workflows
+                     (default: this extension's own repository)
+EOF
+}
+
+# owner/repo of the reusable workflows: env override, else this extension's clone.
+factory_repo() {
+  if [ -n "${GH_FACTORY_REPO:-}" ]; then
+    printf '%s\n' "$GH_FACTORY_REPO"
+    return
+  fi
+  local url
+  url="$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)"
+  url="${url%.git}"
+  case "$url" in
+    *github.com[:/]*) printf '%s\n' "${url##*github.com[:/]}" ;;
+    *) printf '%s\n' "guilbill/gh-factory" ;;
+  esac
+}
+
+confirm() {
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  [ -t 0 ] || return 1
+  local answer
+  read -r -p "$1 [y/N] " answer
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+require_git_root() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+  local top
+  top="$(git rev-parse --show-toplevel)"
+  [ "$top" = "$(pwd -P)" ] || die "run this from the repository root: $top"
+}
+
+require_gh() {
+  command -v gh >/dev/null || die "the GitHub CLI (gh) is required"
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated: run 'gh auth login'"
+}
+
+require_clean_tree() {
+  [ -z "$(git status --porcelain)" ] || die "the working tree has uncommitted changes: commit or stash them first"
+}
+
+# Sets REPO and DEFAULT_BRANCH. Falls back to local git data when gh is unavailable.
+detect_repo() {
+  local want_gh="$1"
+  REPO=""
+  DEFAULT_BRANCH=""
+  if [ "$want_gh" -eq 1 ]; then
+    local json
+    json="$(gh repo view --json nameWithOwner,defaultBranchRef 2>/dev/null)" \
+      || die "this checkout has no GitHub remote that gh can see"
+    REPO="$(jq -r .nameWithOwner <<<"$json")"
+    DEFAULT_BRANCH="$(jq -r .defaultBranchRef.name <<<"$json")"
+  else
+    DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    DEFAULT_BRANCH="${DEFAULT_BRANCH#origin/}"
+  fi
+  [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="main"
+}
+
+render_template() {
+  local template="$1" ref="$2"
+  sed -e "s|__FACTORY_REPO__|$FACTORY_REPO|g" \
+      -e "s|__FACTORY_REF__|$ref|g" \
+      -e "s|__DEFAULT_BRANCH__|$DEFAULT_BRANCH|g" \
+      "$template"
+}
+
+# Writes one rendered file. Prints its path when it changed.
+write_file() {
+  local target="$1" rendered="$2" force="$3"
+  if [ ! -f "$target" ]; then
+    mkdir -p "$(dirname "$target")"
+    cp "$rendered" "$target"
+    info "  created  $target" >&2
+    printf '%s\n' "$target"
+    return
+  fi
+  if cmp -s "$rendered" "$target"; then
+    info "  same     $target" >&2
+    return
+  fi
+  diff -u --label "$target (current)" --label "$target (factory)" "$target" "$rendered" >&2 || true
+  if [ "$force" -eq 1 ] || confirm "Overwrite $target?"; then
+    cp "$rendered" "$target"
+    info "  updated  $target" >&2
+    printf '%s\n' "$target"
+  else
+    info "  kept     $target (differs from the factory template)" >&2
+  fi
+}
+
+write_lessons_file() {
+  if [ -f "$LESSONS_FILE" ]; then
+    info "  same     $LESSONS_FILE (kept as is)" >&2
+    return
+  fi
+  mkdir -p "$(dirname "$LESSONS_FILE")"
+  cat > "$LESSONS_FILE" <<'EOF'
+# Review lessons
+
+Repository-specific guidance for the automated `review-pr` agent, learned from human
+feedback on its comments. Each lesson is a durable rule. Keep the file short.
+EOF
+  info "  created  $LESSONS_FILE" >&2
+  printf '%s\n' "$LESSONS_FILE"
+}
+
+create_labels() {
+  local entry name color description
+  for entry in "${LABELS[@]}"; do
+    IFS='|' read -r name color description <<<"$entry"
+    gh label create "$name" --repo "$REPO" --color "$color" --description "$description" --force >/dev/null
+    info "  label    $name"
+  done
+}
+
+pat_url() {
+  local owner="${REPO%%/*}"
+  printf 'https://github.com/settings/personal-access-tokens/new?name=%s&description=%s&target_name=%s&expires_in=90&contents=write&issues=write&pull_requests=write&actions=write\n' \
+    "gh-factory+${REPO//\//-}" "Lets+gh-factory+labels+and+pushes+trigger+workflows" "$owner"
+}
+
+set_secrets() {
+  local existing
+  existing="$(gh secret list --repo "$REPO" --json name --jq '.[].name' 2>/dev/null)" \
+    || die "cannot list secrets on $REPO: you need admin access, or use --skip-secrets"
+
+  if grep -qx CLAUDE_CODE_OAUTH_TOKEN <<<"$existing"; then
+    info "  secret   CLAUDE_CODE_OAUTH_TOKEN already set"
+  elif [ -t 0 ]; then
+    info ""
+    info "CLAUDE_CODE_OAUTH_TOKEN is missing. Create one with 'claude setup-token'"
+    info "(in another terminal), then paste it below. It is never displayed."
+    gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo "$REPO"
+  else
+    MISSING_SECRETS+=("CLAUDE_CODE_OAUTH_TOKEN")
+  fi
+
+  if grep -qx FACTORY_TOKEN <<<"$existing"; then
+    info "  secret   FACTORY_TOKEN already set"
+  elif [ -t 0 ]; then
+    info ""
+    info "FACTORY_TOKEN is missing. It is a fine-grained PAT that lets factory labels and"
+    info "pushes trigger the next workflows. Create it here (check that the resource owner"
+    info "is ${REPO%%/*} and select only $REPO):"
+    info ""
+    info "  $(pat_url)"
+    info ""
+    info "Permissions: Contents, Issues, Pull requests and Actions, all read and write."
+    if confirm "Set FACTORY_TOKEN now?"; then
+      gh secret set FACTORY_TOKEN --repo "$REPO"
+    else
+      MISSING_SECRETS+=("FACTORY_TOKEN")
+    fi
+  else
+    MISSING_SECRETS+=("FACTORY_TOKEN")
+  fi
+}
+
+switch_to_branch() {
+  local branch="$1"
+  git fetch --quiet origin "$DEFAULT_BRANCH"
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git switch --quiet "$branch"
+    info "  branch   $branch (existing)"
+  else
+    git switch --quiet -c "$branch" "origin/$DEFAULT_BRANCH"
+    info "  branch   $branch (from origin/$DEFAULT_BRANCH)"
+  fi
+}
+
+commit_push_pr() {
+  local branch="$1" message="$2" title="$3" body="$4" no_pr="$5"
+  shift 5
+  git add -- "$@"
+  if git diff --cached --quiet; then
+    info "  nothing to commit"
+    return
+  fi
+  git commit --quiet -m "$message"
+  git push --quiet -u origin "$branch"
+  info "  pushed   $branch"
+  if [ "$no_pr" -eq 1 ]; then
+    return
+  fi
+  local existing_pr
+  existing_pr="$(gh pr list --repo "$REPO" --head "$branch" --state open --json url --jq '.[0].url // empty')"
+  if [ -n "$existing_pr" ]; then
+    PR_URL="$existing_pr"
+    info "  PR       $PR_URL (updated)"
+  else
+    PR_URL="$(gh pr create --repo "$REPO" --base "$DEFAULT_BRANCH" --head "$branch" --title "$title" --body "$body")"
+    info "  PR       $PR_URL"
+  fi
+}
+
+cmd_init() {
+  local ref="$DEFAULT_REF" local_only=0 no_pr=0 skip_secrets=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ref) [ $# -ge 2 ] || die "--ref needs a value"; ref="$2"; shift 2 ;;
+      --local) local_only=1; shift ;;
+      --no-pr) no_pr=1; shift ;;
+      --skip-secrets) skip_secrets=1; shift ;;
+      --force) force=1; shift ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown flag for init: $1" ;;
+    esac
+  done
+
+  require_git_root
+  if [ "$local_only" -eq 0 ]; then
+    require_gh
+    require_clean_tree
+  fi
+  detect_repo "$((1 - local_only))"
+  FACTORY_REPO="$(factory_repo)"
+  MISSING_SECRETS=()
+  PR_URL=""
+
+  info "Wiring ${REPO:-this checkout} onto $FACTORY_REPO@$ref (default branch: $DEFAULT_BRANCH)"
+
+  if [ "$local_only" -eq 0 ]; then
+    step "Branch"
+    orig_branch="$(git branch --show-current)"
+    git show-ref --verify --quiet "refs/heads/$WIRE_BRANCH" || created_branch=1
+    switch_to_branch "$WIRE_BRANCH"
+  fi
+
+  step "Files"
+  local changed=() template target file created_branch=0 orig_branch
+  TMP_DIR="$(mktemp -d)"
+  for template in "$TEMPLATES_DIR"/factory-*.yml; do
+    target=".github/workflows/$(basename "$template")"
+    render_template "$template" "$ref" > "$TMP_DIR/rendered.yml"
+    while IFS= read -r file; do changed+=("$file"); done < <(write_file "$target" "$TMP_DIR/rendered.yml" "$force")
+  done
+  while IFS= read -r file; do changed+=("$file"); done < <(write_lessons_file)
+
+  if [ "$local_only" -eq 1 ]; then
+    step "Done (local only)"
+    info "Files written. Labels, secrets, commit and PR were skipped."
+    return
+  fi
+
+  step "Labels"
+  create_labels
+
+  if [ "$skip_secrets" -eq 0 ]; then
+    step "Secrets"
+    set_secrets
+  fi
+
+  step "Commit"
+  if [ "${#changed[@]}" -gt 0 ]; then
+    commit_push_pr "$WIRE_BRANCH" "Wire the gh-factory workflows" "Wire the factory" \
+      "Adds the gh-factory caller workflows (triage, spec, implement, review, fixes and review lessons) pinned to \`$FACTORY_REPO@$ref\`, plus an empty \`$LESSONS_FILE\`.
+
+Once merged, a new issue gets triaged, and the \`Ready to spec\` / \`Ready to implement\` labels start the agents." \
+      "$no_pr" "${changed[@]}"
+  else
+    info "  every factory file is already up to date"
+    if [ "$created_branch" -eq 1 ] && [ -n "$orig_branch" ]; then
+      git switch --quiet "$orig_branch"
+      git branch --quiet -D "$WIRE_BRANCH"
+      info "  branch   $WIRE_BRANCH removed, back on $orig_branch"
+    fi
+  fi
+
+  step "Summary"
+  info "Repository:  $REPO"
+  info "Factory:     $FACTORY_REPO@$ref"
+  if [ -n "$PR_URL" ]; then info "Pull request: $PR_URL"; fi
+  if [ "${#MISSING_SECRETS[@]}" -gt 0 ]; then
+    info "Still missing secrets: ${MISSING_SECRETS[*]} (set them with 'gh secret set <name> --repo $REPO')"
+  fi
+  info ""
+  info "Next: merge the PR, then open an issue on $REPO and watch the Factory Triage run."
+}
+
+latest_major_tag() {
+  local tag
+  tag="$(gh release view --repo "$FACTORY_REPO" --json tagName --jq .tagName 2>/dev/null || true)"
+  [ -n "$tag" ] || tag="$(gh api "repos/$FACTORY_REPO/tags" --jq '.[0].name // empty' 2>/dev/null || true)"
+  [ -n "$tag" ] || die "cannot find a release of $FACTORY_REPO: pass a ref explicitly"
+  # v1.4.2 -> v1: callers follow the moving major tag.
+  printf '%s\n' "${tag%%.*}"
+}
+
+cmd_upgrade() {
+  local ref="" local_only=0 no_pr=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --local) local_only=1; shift ;;
+      --no-pr) no_pr=1; shift ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown flag for upgrade: $1" ;;
+      *) ref="$1"; shift ;;
+    esac
+  done
+
+  require_git_root
+  if [ "$local_only" -eq 0 ]; then
+    require_gh
+    require_clean_tree
+  fi
+  detect_repo "$((1 - local_only))"
+  FACTORY_REPO="$(factory_repo)"
+  PR_URL=""
+  if [ -z "$ref" ]; then
+    require_gh
+    ref="$(latest_major_tag)"
+  fi
+
+  local callers=()
+  local file
+  for file in .github/workflows/factory-*.yml; do
+    if [ -f "$file" ]; then callers+=("$file"); fi
+  done
+  [ "${#callers[@]}" -gt 0 ] || die "no factory workflows found: run 'gh factory init' first"
+
+  info "Upgrading ${REPO:-this checkout} to $FACTORY_REPO@$ref"
+
+  local branch="chore/upgrade-factory-$ref"
+  if [ "$local_only" -eq 0 ]; then
+    step "Branch"
+    switch_to_branch "$branch"
+  fi
+
+  step "Files"
+  local changed=() template target pattern
+  TMP_DIR="$(mktemp -d)"
+  # Rewrites owner/repo too, so callers follow a transferred factory repo.
+  pattern="s|uses: *[^/[:space:]]*/[^/[:space:]]*/\\.github/workflows/\\([A-Za-z0-9_.-]*\\.yml\\)@[^[:space:]]*|uses: $FACTORY_REPO/.github/workflows/\\1@$ref|"
+  for file in "${callers[@]}"; do
+    sed -e "$pattern" "$file" > "$TMP_DIR/upgraded.yml"
+    if cmp -s "$file" "$TMP_DIR/upgraded.yml"; then
+      info "  same     $file"
+    else
+      cp "$TMP_DIR/upgraded.yml" "$file"
+      info "  updated  $file"
+      changed+=("$file")
+    fi
+    if [ -f "$TEMPLATES_DIR/$(basename "$file")" ]; then
+      render_template "$TEMPLATES_DIR/$(basename "$file")" "$ref" > "$TMP_DIR/rendered.yml"
+      cmp -s "$file" "$TMP_DIR/rendered.yml" \
+        || info "           note: $file differs from the current template (edited by hand, or the template changed)"
+    fi
+  done
+  for template in "$TEMPLATES_DIR"/factory-*.yml; do
+    target=".github/workflows/$(basename "$template")"
+    if [ ! -f "$target" ]; then
+      render_template "$template" "$ref" > "$target"
+      info "  created  $target"
+      changed+=("$target")
+    fi
+  done
+
+  if [ "$local_only" -eq 1 ] || [ "${#changed[@]}" -eq 0 ]; then
+    step "Done"
+    if [ "${#changed[@]}" -eq 0 ]; then info "Already on $ref."; fi
+    return
+  fi
+
+  step "Commit"
+  commit_push_pr "$branch" "Upgrade gh-factory to $ref" "Upgrade the factory to $ref" \
+    "Points the factory workflows at \`$FACTORY_REPO@$ref\`. Release notes: https://github.com/$FACTORY_REPO/releases" \
+    "$no_pr" "${changed[@]}"
+  if [ -n "$PR_URL" ]; then info "Next: review and merge $PR_URL"; fi
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

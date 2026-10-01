@@ -1,0 +1,95 @@
+name: Factory implement
+
+# Reusable: implements an issue labeled ready to implement, opens a PR and
+# reports back on the issue. The agent finds the repository's own toolchain.
+#
+# Called from the target repo's factory-implement.yml on `issues: labeled`.
+
+on:
+  workflow_call:
+    inputs:
+      extra_allowed_tools:
+        description: "Extra Claude Code tool rules, comma-separated, e.g. Bash(docker:*)"
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      FACTORY_TOKEN:
+        required: false
+
+env:
+  # Common package managers, runtimes and build tools, so the agent can install,
+  # lint, typecheck and test any stack. Interpreters can run arbitrary code: this
+  # list keeps the agent on familiar tools, it is not a sandbox.
+  TOOLCHAIN_TOOLS: "Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(bun:*),Bash(bunx:*),Bash(corepack:*),Bash(node:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(pip3:*),Bash(uv:*),Bash(uvx:*),Bash(poetry:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*),Bash(composer:*),Bash(php:*),Bash(vendor/bin/*),Bash(./vendor/bin/*),Bash(go:*),Bash(golangci-lint:*),Bash(cargo:*),Bash(bundle:*),Bash(ruby:*),Bash(rake:*),Bash(mvn:*),Bash(./mvnw:*),Bash(gradle:*),Bash(./gradlew:*),Bash(make:*),Bash(just:*),Bash(task:*)"
+  BASE_TOOLS: "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(diff:*)"
+
+jobs:
+  implement:
+    name: Implement issue
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.label.name == 'Ready to implement' ||
+      github.event.label.name == 'ready-to-implement' ||
+      github.event.label.name == 'ready to implement'
+    concurrency:
+      group: factory-implement-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # let the agent commit and push an implementation branch
+      issues: write # let the agent post progress and final PR link comments
+      pull-requests: write # let the agent open the implementation PR
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Pushes and PRs made with a PAT trigger the review workflow.
+          token: ${{ secrets.FACTORY_TOKEN || github.token }}
+
+      - name: Fetch factory skills
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Keep factory files out of git
+        run: |
+          test -f .factory/skills/implementation/SKILL.md || { echo "::error::Factory skills were not fetched." >&2; exit 1; }
+          echo ".factory/" >> .git/info/exclude
+
+      - name: Implement issue with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.FACTORY_TOKEN || github.token }}
+          prompt: |
+            Implement the GitHub issue that was just labeled ready to implement.
+
+            First read `.factory/skills/implementation/SKILL.md`, then follow it exactly.
+            It points to sibling skills in `.factory/skills/` (`repo-toolchain`,
+            `validate-changes-match-specs`): read them when it says so.
+
+            - Repository: ${{ github.repository }}
+            - Issue number: #${{ github.event.issue.number }}
+            - Issue URL: ${{ github.event.issue.html_url }}
+            - Applied label: ${{ github.event.label.name }}
+            - Follow-along link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            This is an automated run: nobody will answer questions, so follow
+            the "Automated runs" rules of `validate-changes-match-specs`.
+            Install dependencies and validate with this repository's own
+            commands, found with `repo-toolchain`.
+
+            Create a branch named `<type>/issue-${{ github.event.issue.number }}-<short-slug>`
+            where `<type>` is `fix`, `feat`, `chore`, `docs` or `refactor`, push
+            it, and open a GitHub pull request. The PR body must link to this
+            issue using `Closes #${{ github.event.issue.number }}` when the
+            implementation fully resolves it.
+
+            `.factory/` holds the factory's own skills: never edit or commit it.
+          claude_args: |
+            --allowedTools "${{ env.BASE_TOOLS }},${{ env.TOOLCHAIN_TOOLS }}${{ inputs.extra_allowed_tools && format(',{0}', inputs.extra_allowed_tools) || '' }}"

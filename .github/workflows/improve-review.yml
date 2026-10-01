@@ -1,0 +1,117 @@
+name: Factory improve review
+
+# Reusable: daily outer loop over automated code review.
+# 1. Collect human reactions to review-pr comments from the lookback window
+# 2. Run Claude Code with the improve-review-pr skill
+# 3. If durable knowledge is found, open a PR updating .agents/review-lessons.md
+#
+# Called from the target repo's factory-improve-review.yml on a schedule.
+
+on:
+  workflow_call:
+    inputs:
+      since_hours:
+        description: "How many hours of review feedback to inspect"
+        type: string
+        required: false
+        default: "24"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      FACTORY_TOKEN:
+        required: false
+
+jobs:
+  improve:
+    name: Learn from review feedback
+    runs-on: ubuntu-latest
+    concurrency:
+      group: factory-improve-review
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A PAT opens the lessons PR without the "Actions can create PRs" setting.
+          token: ${{ secrets.FACTORY_TOKEN || github.token }}
+
+      - name: Fetch factory skills
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .factory
+          persist-credentials: false
+
+      - name: Keep factory files out of git
+        run: |
+          test -f .factory/skills/improve-review-pr/SKILL.md || { echo "::error::Factory skills were not fetched." >&2; exit 1; }
+          echo ".factory/" >> .git/info/exclude
+
+      - name: Collect review feedback corpus
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SINCE_HOURS: ${{ inputs.since_hours || '24' }}
+        run: |
+          set -euo pipefail
+
+          python3 .factory/skills/improve-review-pr/scripts/collect_review_feedback.py \
+            --repo "${REPO}" \
+            --since-hours "${SINCE_HOURS}" \
+            --output feedback_corpus.json
+
+          {
+            echo "summary<<EOF"
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path("feedback_corpus.json").read_text(encoding="utf-8"))
+          summary = data.get("summary") or {}
+          print(
+              f"PRs inspected: {summary.get('prs_inspected', 0)}; "
+              f"validated={summary.get('validated', 0)}, "
+              f"corrected={summary.get('corrected', 0)}, "
+              f"refined={summary.get('refined', 0)}, "
+              f"ambiguous={summary.get('ambiguous', 0)}"
+          )
+          PY
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload feedback corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-feedback-corpus
+          path: feedback_corpus.json
+          if-no-files-found: error
+
+      - name: Improve review lessons with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.FACTORY_TOKEN || github.token }}
+          prompt: |
+            Run the daily outer loop over automated code-review feedback.
+
+            First read `.factory/skills/improve-review-pr/SKILL.md`, then follow it exactly.
+
+            - Repository: ${{ github.repository }}
+            - Lookback window: ${{ inputs.since_hours || '24' }} hours
+            - Feedback corpus already prepared at `feedback_corpus.json`
+            - Feedback summary: ${{ steps.collect.outputs.summary }}
+
+            Analyze the corpus and, only if warranted, update
+            `.agents/review-lessons.md` and open a pull request with that single
+            file. Never commit `feedback_corpus.json` or anything under `.factory/`.
+
+            Do not change product code. Do not open a PR if there is no durable learning.
+            End with the report format required by the skill.
+          claude_args: |
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh pr:*),Bash(gh api:*)"
