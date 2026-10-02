@@ -42,9 +42,9 @@ grep -q "local tweak" .github/workflows/factory-review.yml || fail "hand edit wa
 
 echo "upgrade --local v2 (and a transferred factory repo)"
 rm .github/workflows/factory-improve-review.yml
-GH_FACTORY_REPO="marmelab/gh-factory" "$ROOT/gh-factory" upgrade --local v2 > "$tmp/upgrade.log" 2>&1
+GH_FACTORY_REPO="example-org/gh-factory" "$ROOT/gh-factory" upgrade --local v2 > "$tmp/upgrade.log" 2>&1
 for name in triage spec implement review address-review improve-review; do
-  grep -q "uses: marmelab/gh-factory/.github/workflows/$name.yml@v2" ".github/workflows/factory-$name.yml" \
+  grep -q "uses: example-org/gh-factory/.github/workflows/$name.yml@v2" ".github/workflows/factory-$name.yml" \
     || fail "factory-$name.yml was not upgraded"
 done
 
